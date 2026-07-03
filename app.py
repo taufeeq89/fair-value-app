@@ -1,52 +1,14 @@
 from flask import Flask, jsonify, render_template
 from flask_cors import CORS
-import requests
 from datetime import datetime
+import yfinance as yf
+
+# Import modules from our segregated ecosystem files
+from services import fmp_v3, fmp_stable, try_endpoints, fetch_yfinance_eps
+from models import get_terminal_growth, run_dcf_engine
 
 app = Flask(__name__)
 CORS(app)
-
-API_KEY  = "kXu1K3e6VnOLjRXubDJqLU40APY6UBrf"
-BASE_V3  = "https://financialmodelingprep.com/api/v3"
-BASE_STB = "https://financialmodelingprep.com/stable"
-
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "FairValueApp/1.0"})
-
-def fmp_v3(path, params=None):
-    """Call the classic v3 API."""
-    p = dict(params or {})
-    p["apikey"] = API_KEY
-    r = SESSION.get(f"{BASE_V3}/{path}", params=p, timeout=12)
-    r.raise_for_status()
-    data = r.json()
-    # v3 sometimes returns {"Error Message": "..."} on bad key / plan
-    if isinstance(data, dict) and data.get("Error Message"):
-        raise PermissionError(data["Error Message"])
-    return data
-
-def fmp_stable(endpoint, params=None):
-    """Call the newer /stable API (free-tier friendly)."""
-    p = dict(params or {})
-    p["apikey"] = API_KEY
-    r = SESSION.get(f"{BASE_STB}/{endpoint}", params=p, timeout=12)
-    r.raise_for_status()
-    data = r.json()
-    if isinstance(data, dict) and data.get("Error Message"):
-        raise PermissionError(data["Error Message"])
-    return data
-
-def try_endpoints(calls):
-    """Try a list of (fn, *args) in order, return first success."""
-    last_err = None
-    for fn, *args in calls:
-        try:
-            result = fn(*args)
-            if result:
-                return result, None
-        except Exception as e:
-            last_err = e
-    return None, last_err
 
 @app.route("/")
 def index():
@@ -58,179 +20,195 @@ def stock_data(ticker):
     result = {}
     errors = []
 
-    # ── 1. Profile ──────────────────────────────────────────────────────────
+    # ── 1. PROFILE (Hardened FMP & yfinance Hybrid Sequence) ─────────────────
     profile_data, err = try_endpoints([
-        (fmp_v3,     f"profile/{ticker}"),
-        (fmp_stable, "profile", {"symbol": ticker}),
+        (fmp_v3, f"profile/{ticker}"),
+        (fmp_stable, f"profile/{ticker}"), # Fixed path structure
     ])
-    if not profile_data:
-        return jsonify({"error": f'Ticker "{ticker}" not found. '
-                                 f'Check the symbol or try again. ({err})'}), 404
+    
+    if profile_data:
+        p = profile_data[0] if isinstance(profile_data, list) else profile_data
+        p_price = round(float(p.get("price", 0) or 0), 2)
+        p_pe = round(float(p.get("pe", 0) or 0), 2)
+        p_beta = round(float(p.get("beta", 1.0) or 1.0), 2)
 
-    p = profile_data[0] if isinstance(profile_data, list) else profile_data
-    result.update({
-        "companyName": p.get("companyName", ticker),
-        "ticker":      p.get("symbol",      ticker),
-        "exchange":    p.get("exchangeShortName", p.get("exchange", "")),
-        "sector":      p.get("sector",   ""),
-        "industry":    p.get("industry", ""),
-        "mktCap":      p.get("mktCap",   0),
-        "beta":        round(float(p.get("beta", 1.0) or 1.0), 2),
-        "price":       round(float(p.get("price", 0)  or 0),   2),
-        "priceSource": "FMP /profile — real-time market price",
-        "peRatio":     round(float(p.get("pe",    0)  or 0),   1),
-    })
+        result.update({
+            "companyName": p.get("companyName", ticker),
+            "ticker": p.get("symbol", ticker),
+            "exchange": p.get("exchangeShortName", p.get("exchange", "")),
+            "sector": p.get("sector", "Healthcare"),
+            "industry": p.get("industry", "Medical Devices"),
+            "mktCap": p.get("mktCap", 0),
+            "beta": p_beta,
+            "price": p_price,
+            "priceSource": "FMP /profile — primary core data",
+            "peRatio": p_pe,
+        })
+    else:
+        # ABSOLUTE RESCUE SEQUENCE: Fetch metadata profile using yfinance directly
+        errors.append(f"FMP Profile blocked (403/Restricted Tier). Deploying yfinance recovery framework. Original error: {err}")
+        try:
+            yf_ticker = yf.Ticker(ticker)
+            yf_info = yf_ticker.info
+            
+            p_price = round(float(yf_info.get("currentPrice") or yf_info.get("regularMarketPrice") or 0), 2)
+            p_pe = round(float(yf_info.get("trailingPE") or yf_info.get("forwardPE") or 0), 2)
+            p_beta = round(float(yf_info.get("beta" or 1.0)), 2)
 
-    # ── 2. Real-time quote (better price) ───────────────────────────────────
+            result.update({
+                "companyName": yf_info.get("longName", ticker),
+                "ticker": ticker,
+                "exchange": yf_info.get("exchange", "NYSE"),
+                "sector": yf_info.get("sector", "Healthcare"),
+                "industry": yf_info.get("industry", "Medical Devices"),
+                "mktCap": yf_info.get("marketCap", 0),
+                "beta": p_beta if p_beta > 0 else 1.0,
+                "price": p_price,
+                "priceSource": "yfinance — profile scraping data engine backup",
+                "peRatio": p_pe,
+            })
+        except Exception as yf_prof_err:
+            return jsonify({"error": f"Profile execution completely locked. Failed FMP and yfinance options: {yf_prof_err}"}), 404
+
+    # Cache profile readings to evaluate proxies later if endpoints fail
+    p_price = result["price"]
+    p_pe = result["peRatio"]
+
+    # ── 2. REAL-TIME QUOTE OPTIMIZATION ─────────────────────────────────────
     try:
         q_data, _ = try_endpoints([
-            (fmp_v3,     f"quote/{ticker}"),
-            (fmp_stable, "quote",   {"symbol": ticker}),
-            (fmp_stable, "quotes/stock", {"symbol": ticker}),
+            (fmp_v3, f"quote/{ticker}"),
+            (fmp_stable, f"quote/{ticker}"),
         ])
         if q_data:
             q = q_data[0] if isinstance(q_data, list) else q_data
             if q.get("price"):
-                result["price"]       = round(float(q["price"]), 2)
-                result["priceSource"] = (
-                    f"FMP /quote — real-time price "
-                    f"(as of {datetime.now().strftime('%H:%M:%S')})"
-                )
+                result["price"] = round(float(q["price"]), 2)
+                result["priceSource"] = f"FMP /quote — live tracking (as of {datetime.now().strftime('%H:%M:%S')})"
     except Exception as e:
-        errors.append(f"Quote: {e}")
+        errors.append(f"Quote module fallback skipped: {e}")
 
-    # ── 3. EPS (TTM) from income statement ──────────────────────────────────
+    # ── 3. DILUTED EPS HANDLING ─────────────────────────────────────────────
     try:
         inc, _ = try_endpoints([
-            (fmp_v3,     f"income-statement/{ticker}", {"limit": 1}),
-            (fmp_stable, "income-statement",           {"symbol": ticker, "limit": 1}),
+            (fmp_v3, f"income-statement/{ticker}", {"limit": 1}),
+            (fmp_stable, f"income-statement/{ticker}", {"limit": 1}),
         ])
         if inc:
             row = inc[0] if isinstance(inc, list) else inc
-            eps_val = row.get("epsdiluted") or row.get("eps") or 0
-            result["eps"]       = round(float(eps_val), 2)
-            result["epsSource"] = (
-                f"FMP /income-statement — diluted EPS "
-                f"(period ending {row.get('date', 'N/A')})"
-            )
+            eps_val = row.get("epsdiluted") or row.get("eps")
+            if eps_val is None:
+                raise ValueError("EPS elements missing from FMP statement data")
+            result["eps"] = round(float(eps_val), 2)
+            result["epsSource"] = f"FMP /income-statement — diluted EPS"
         else:
-            raise ValueError("No income data")
+            raise ValueError("FMP tier restriction blocked statement")
     except Exception as e:
-        # Last resort: eps from profile
-        fallback_eps = float(p.get("eps", 0) or 0)
-        result["eps"]       = round(fallback_eps, 2)
-        result["epsSource"] = "FMP /profile eps field (income-statement unavailable)"
-        errors.append(f"Income statement: {e}")
+        errors.append(f"Income statement FMP failed: {e}")
+        try:
+            eps_val, source_label = fetch_yfinance_eps(ticker)
+            result["eps"] = eps_val
+            result["epsSource"] = source_label
+        except Exception as yf_err:
+            errors.append(f"yfinance Fallback failed: {yf_err}")
+            if p_pe > 0 and p_price > 0:
+                result["eps"] = round(p_price / p_pe, 2)
+                result["epsSource"] = f"Calculated Profile Proxy (Price ${p_price} / P/E {p_pe})"
+            else:
+                result["eps"] = 0.0
 
-    # ── 4. Analyst growth estimates ─────────────────────────────────────────
+    # ── 4. ANALYST GROWTH ESTIMATES ─────────────────────────────────────────
     try:
         est, _ = try_endpoints([
-            (fmp_v3,     f"analyst-estimates/{ticker}", {"limit": 6}),
-            (fmp_stable, "analyst-estimates",           {"symbol": ticker, "limit": 6}),
+            (fmp_v3, f"analyst-estimates/{ticker}", {"limit": 6}),
+            (fmp_stable, f"analyst-estimates/{ticker}", {"limit": 6}),
         ])
-        today   = datetime.today()
-        future  = []
-        if est:
+        current_eps = result.get("eps", 0)
+        growth_calculated = False
+
+        if est and current_eps > 0:
             rows = est if isinstance(est, list) else [est]
-            future = [e for e in rows
-                      if datetime.strptime(e["date"], "%Y-%m-%d") > today]
+            today_str = datetime.today().strftime("%Y-%m-%d")
+            future = [r for r in rows if r.get("date") and r["date"] > today_str]
+            future.sort(key=lambda x: x["date"])
+            
+            if future:
+                target_index = min(2, len(future) - 1)
+                target_estimate = future[target_index].get("estimatedEpsAvg")
+                if target_estimate and target_estimate > 0:
+                    years_forward = target_index + 1
+                    implied = (pow(target_estimate / current_eps, 1 / years_forward) - 1) * 100
+                    result["growthRate"] = round(min(max(implied, 1.0), 50.0), 1)
+                    result["growthSource"] = f"FMP /analyst-estimates — implied {years_forward}-yr EPS CAGR"
+                    growth_calculated = True
 
-        if len(future) >= 2 and result.get("eps") and result["eps"] != 0:
-            eps_vals = [e.get("estimatedEpsAvg") for e in future[:3]
-                        if e.get("estimatedEpsAvg")]
-            if len(eps_vals) >= 2:
-                implied = (pow(eps_vals[-1] / result["eps"],
-                               1 / len(eps_vals)) - 1) * 100
-                result["growthRate"]   = round(min(max(implied, 1.0), 50.0), 1)
-                result["growthSource"] = (
-                    f"FMP /analyst-estimates — implied {len(eps_vals)}-yr EPS CAGR "
-                    f"from Wall St consensus (Goldman, JPMorgan, etc.)"
-                )
-            else:
-                raise ValueError("Not enough EPS points")
-        else:
-            raise ValueError("Insufficient future estimates")
+        if not growth_calculated:
+            raise ValueError("Insufficient coordinates")
     except Exception as e:
-        result["growthRate"]   = 10.0
-        result["growthSource"] = "Default 10% — analyst consensus unavailable for this ticker"
         errors.append(f"Growth estimates: {e}")
+        sector_growth_defaults = {"Technology": 12.0, "Healthcare": 8.5, "Consumer Cyclical": 9.0, "Financial Services": 5.5}
+        result["growthRate"] = sector_growth_defaults.get(result.get("sector"), 6.5)
+        result["growthSource"] = f"Sector tracking proxy baseline default for {result.get('sector', 'General')}"
 
-    # ── 5. WACC / Discount rate ─────────────────────────────────────────────
+    # ── 5. WACC / DISCOUNT RATE ESTIMATION ─────────────────────────────────
     try:
         km, _ = try_endpoints([
-            (fmp_v3,     f"key-metrics/{ticker}",   {"limit": 1}),
-            (fmp_stable, "key-metrics",             {"symbol": ticker, "limit": 1}),
+            (fmp_v3, f"key-metrics/{ticker}", {"limit": 1}),
+            (fmp_stable, f"key-metrics/{ticker}", {"limit": 1}),
         ])
         if km:
-            row  = km[0] if isinstance(km, list) else km
+            row = km[0] if isinstance(km, list) else km
             roic = float(row.get("roic") or 0)
             if roic > 0:
                 wacc = round(min(max(roic * 100 * 0.65 + 3.5, 7.0), 16.0), 1)
-                result["wacc"]       = wacc
-                result["waccSource"] = (
-                    f"FMP /key-metrics — estimated from ROIC {round(roic*100,1)}% "
-                    f"× 0.65 + 3.5% risk-free rate (period {row.get('date','N/A')})"
-                )
+                result["wacc"] = wacc
+                result["waccSource"] = f"FMP /key-metrics — inferred via ROIC {round(roic*100,1)}%"
             else:
-                raise ValueError("ROIC = 0")
+                raise ValueError("ROIC calculation out of bounds")
         else:
-            raise ValueError("No key-metrics")
+            raise ValueError("Premium data restricted")
     except Exception as e:
-        beta = result.get("beta", 1.0)
-        wacc = round(min(max(3.5 + beta * 5.5, 7.0), 15.0), 1)
-        result["wacc"]       = wacc
-        result["waccSource"] = (
-            f"CAPM fallback — 3.5% risk-free + β({beta}) × 5.5% equity risk premium"
-        )
-        errors.append(f"Key-metrics/WACC: {e}")
+        errors.append(f"Key-metrics/WACC fallback applied: {e}")
+        wacc = round(min(max(3.5 + result["beta"] * 5.5, 7.0), 15.0), 1)
+        result["wacc"] = wacc
+        result["waccSource"] = f"CAPM Alternative: 3.5% Risk-Free Rate + β({result['beta']}) × 5.5% Equity Risk Premium"
 
-    # ── 6. Exit P/E (historical average) ────────────────────────────────────
+    # ── 6. HISTORICAL EXIT P/E MULTIPLE GENERATOR ──────────────────────────
     try:
         rat, _ = try_endpoints([
-            (fmp_v3,     f"ratios/{ticker}",  {"limit": 4}),
-            (fmp_stable, "ratios",            {"symbol": ticker, "limit": 4}),
+            (fmp_v3, f"ratios/{ticker}", {"limit": 4}),
+            (fmp_stable, f"ratios/{ticker}", {"limit": 4}),
         ])
         if rat:
-            rows   = rat if isinstance(rat, list) else [rat]
-            pe_vals = [float(r.get("priceEarningsRatio") or 0) for r in rows
-                       if 4 < float(r.get("priceEarningsRatio") or 0) < 120]
+            rows = rat if isinstance(rat, list) else [rat]
+            pe_vals = [float(r.get("priceEarningsRatio") or 0) for r in rows if 4.0 < float(r.get("priceEarningsRatio") or 0) < 120.0]
             if pe_vals:
-                avg_pe = round(sum(pe_vals) / len(pe_vals), 1)
-                result["exitPE"]       = avg_pe
-                result["exitPESource"] = (
-                    f"FMP /ratios — {len(pe_vals)}-yr avg trailing P/E "
-                    f"({', '.join(str(round(v,1)) for v in pe_vals)})"
-                )
+                result["exitPE"] = round(sum(pe_vals) / len(pe_vals), 1)
+                result["exitPESource"] = f"FMP /ratios — {len(pe_vals)}-yr historical average trailing P/E"
             else:
-                raise ValueError("No valid P/E in ratios")
+                raise ValueError("Out of bounds lookups")
         else:
-            raise ValueError("No ratios data")
+            raise ValueError("Premium tier locked")
     except Exception as e:
-        pe_fb = result.get("peRatio", 0)
-        result["exitPE"]       = pe_fb if 5 < pe_fb < 100 else 18.0
-        result["exitPESource"] = "FMP /profile trailing P/E (ratios endpoint unavailable)"
-        errors.append(f"Ratios/P/E: {e}")
+        errors.append(f"Ratios/PE Multiples fallback applied: {e}")
+        if p_pe > 4.0:
+            result["exitPE"] = p_pe
+            result["exitPESource"] = "FMP / profile (or yfinance metadata proxy) current trailing P/E ratio"
+        else:
+            result["exitPE"] = 16.5
+            result["exitPESource"] = "Market baseline valuation multi conservative choice"
 
-    # ── 7. Terminal growth by sector ─────────────────────────────────────────
-    tg_map = {
-        "Technology": 3.0, "Healthcare": 2.8,
-        "Consumer Cyclical": 2.5, "Financial Services": 2.5,
-        "Industrials": 2.5,       "Energy": 2.0,
-        "Utilities": 2.0,         "Real Estate": 2.5,
-        "Basic Materials": 2.0,   "Communication Services": 2.5,
-        "Consumer Defensive": 2.5,
-    }
+    # ── 7. TERMINAL LONG-TERM GROWTH ───────────────────────────────────────
     sector = result.get("sector", "")
-    result["terminalGrowth"]  = tg_map.get(sector, 2.5)
-    result["terminalSource"]  = (
-        f"Long-run GDP growth proxy for {sector or 'general'} sector "
-        f"(2–3%, must stay below WACC)"
-    )
+    result["terminalGrowth"] = get_terminal_growth(sector)
+    result["terminalSource"] = f"Long-run macro economic GDP proxy expansion track for {sector or 'unclassified'} sector operations"
+
+    # ── 8. INTRINSIC VALUE CALCULATION ENGINE ──────────────────────────────
+    run_dcf_engine(result, errors)
+
     result["warnings"] = errors
     return jsonify(result)
 
-
 if __name__ == "__main__":
-    print("\n  Fair Value Calculator — backend running.")
-    print("  Open  http://localhost:5000  in your browser.\n")
+    print("\n Modular Hybrid Backend Server Online — Listening on Port 5000")
     app.run(debug=True, port=5000)
